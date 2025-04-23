@@ -24,6 +24,7 @@ class KaggleDataFetcher:
         self._cache = None
         self._last_fetch = None
         self._cache_duration = timedelta(hours=1)  # Cache for 1 hour
+        self._player_names = None
 
     def _authenticate(self):
         """Authenticate with Kaggle API using environment variables"""
@@ -73,9 +74,9 @@ class KaggleDataFetcher:
                 force=True
             )
             
-            # Read the CSV files
-            stats_df = pd.read_csv(f"/tmp/{self.stats_file}")
-            players_df = pd.read_csv(f"/tmp/{self.players_file}")
+            # Read the CSV files with low_memory=False to avoid mixed type warnings
+            stats_df = pd.read_csv(f"/tmp/{self.stats_file}", low_memory=False)
+            players_df = pd.read_csv(f"/tmp/{self.players_file}", low_memory=False)
             
             # Clean up the downloaded files
             os.remove(f"/tmp/{self.stats_file}")
@@ -91,70 +92,150 @@ class KaggleDataFetcher:
     def _process_data(self, stats_df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
         """Process and aggregate the player statistics"""
         try:
-            # Convert date columns to datetime
-            stats_df['Date'] = pd.to_datetime(stats_df['Date'])
+            # Create full player name
+            stats_df['Player'] = stats_df['firstName'] + ' ' + stats_df['lastName']
             
-            # Group by player and calculate career totals
-            career_stats = stats_df.groupby('Player').agg({
-                'PTS': 'sum',
-                'AST': 'sum',
-                'REB': 'sum',
-                'STL': 'sum',
-                'BLK': 'sum',
-                'TOV': 'sum',
-                'FGM': 'sum',
-                'FGA': 'sum',
-                '3PM': 'sum',
-                '3PA': 'sum',
-                'FTM': 'sum',
-                'FTA': 'sum',
-                'Games': 'count'
+            # Store unique player names
+            self._player_names = sorted(stats_df['Player'].unique().tolist())
+            
+            # Convert date column to datetime
+            stats_df['gameDate'] = pd.to_datetime(stats_df['gameDate'])
+            
+            # Filter out preseason games
+            stats_df = stats_df[~stats_df['gameType'].str.contains('Preseason', case=False, na=False)]
+            
+            # Create separate dataframes for regular season and playoffs
+            regular_season_df = stats_df[
+                stats_df['gameType'].str.contains('Regular Season|NBA Emirates Cup', case=False, na=False)
+            ]
+            playoffs_df = stats_df[
+                stats_df['gameType'].str.contains('Playoffs|Play-in Tournament', case=False, na=False)
+            ]
+            
+            # Function to calculate stats for a given dataframe
+            def calculate_stats(df, prefix=''):
+                if df.empty:
+                    return pd.DataFrame()
+                
+                stats = df.groupby('Player').agg({
+                    'points': 'sum',
+                    'assists': 'sum',
+                    'reboundsTotal': 'sum',
+                    'steals': 'sum',
+                    'blocks': 'sum',
+                    'turnovers': 'sum',
+                    'fieldGoalsMade': 'sum',
+                    'fieldGoalsAttempted': 'sum',
+                    'threePointersMade': 'sum',
+                    'threePointersAttempted': 'sum',
+                    'freeThrowsMade': 'sum',
+                    'freeThrowsAttempted': 'sum',
+                    'gameDate': 'count'  # Use gameDate count as Games played
+                }).reset_index()
+                
+                # Rename gameDate count to Games
+                stats.rename(columns={'gameDate': 'Games'}, inplace=True)
+                
+                # Calculate averages
+                stats['PPG'] = stats['points'] / stats['Games']
+                stats['APG'] = stats['assists'] / stats['Games']
+                stats['RPG'] = stats['reboundsTotal'] / stats['Games']
+                stats['SPG'] = stats['steals'] / stats['Games']
+                stats['BPG'] = stats['blocks'] / stats['Games']
+                stats['TOPG'] = stats['turnovers'] / stats['Games']
+                stats['FG%'] = (stats['fieldGoalsMade'] / stats['fieldGoalsAttempted'] * 100).round(1)
+                stats['3P%'] = (stats['threePointersMade'] / stats['threePointersAttempted'] * 100).round(1)
+                stats['FT%'] = (stats['freeThrowsMade'] / stats['freeThrowsAttempted'] * 100).round(1)
+                
+                # Add prefix to all columns except Player
+                if prefix:
+                    stats.columns = [f'{prefix}_{col}' if col != 'Player' else col for col in stats.columns]
+                
+                return stats
+            
+            # Calculate stats for each category
+            regular_season_stats = calculate_stats(regular_season_df, 'Regular')
+            playoffs_stats = calculate_stats(playoffs_df, 'Playoffs')
+            combined_stats = calculate_stats(stats_df, 'Career')
+            
+            # Merge all stats
+            final_stats = pd.merge(regular_season_stats, playoffs_stats, on='Player', how='outer')
+            final_stats = pd.merge(final_stats, combined_stats, on='Player', how='outer')
+            
+            # Fill NaN values with 0
+            final_stats = final_stats.fillna(0)
+            
+            # Get latest season stats (using gameDate to determine season)
+            latest_date = stats_df['gameDate'].max()
+            latest_season_start = latest_date.replace(month=10, day=1)  # NBA season typically starts in October
+            if latest_date.month < 10:
+                latest_season_start = latest_season_start.replace(year=latest_season_start.year - 1)
+            
+            latest_stats = stats_df[stats_df['gameDate'] >= latest_season_start].groupby('Player').agg({
+                'points': 'mean',
+                'assists': 'mean',
+                'reboundsTotal': 'mean',
+                'steals': 'mean',
+                'blocks': 'mean',
+                'turnovers': 'mean',
+                'fieldGoalsMade': 'mean',
+                'fieldGoalsAttempted': 'mean',
+                'threePointersMade': 'mean',
+                'threePointersAttempted': 'mean',
+                'freeThrowsMade': 'mean',
+                'freeThrowsAttempted': 'mean',
+                'gameDate': 'count'
             }).reset_index()
             
-            # Calculate averages
-            career_stats['PPG'] = career_stats['PTS'] / career_stats['Games']
-            career_stats['APG'] = career_stats['AST'] / career_stats['Games']
-            career_stats['RPG'] = career_stats['REB'] / career_stats['Games']
-            career_stats['SPG'] = career_stats['STL'] / career_stats['Games']
-            career_stats['BPG'] = career_stats['BLK'] / career_stats['Games']
-            career_stats['TOPG'] = career_stats['TOV'] / career_stats['Games']
-            career_stats['FG%'] = (career_stats['FGM'] / career_stats['FGA'] * 100).round(1)
-            career_stats['3P%'] = (career_stats['3PM'] / career_stats['3PA'] * 100).round(1)
-            career_stats['FT%'] = (career_stats['FTM'] / career_stats['FTA'] * 100).round(1)
-            
-            # Get latest season stats
-            latest_season = stats_df['Season'].max()
-            latest_stats = stats_df[stats_df['Season'] == latest_season].groupby('Player').agg({
-                'PTS': 'mean',
-                'AST': 'mean',
-                'REB': 'mean',
-                'STL': 'mean',
-                'BLK': 'mean',
-                'TOV': 'mean',
-                'FGM': 'mean',
-                'FGA': 'mean',
-                '3PM': 'mean',
-                '3PA': 'mean',
-                'FTM': 'mean',
-                'FTA': 'mean',
-                'Games': 'count'
-            }).reset_index()
+            # Rename gameDate count to Games in latest stats
+            latest_stats.rename(columns={'gameDate': 'Games'}, inplace=True)
             
             # Add season prefix to latest stats columns
             latest_stats.columns = [f'Current_{col}' if col != 'Player' else col for col in latest_stats.columns]
             
-            # Merge career and latest stats
-            final_stats = pd.merge(career_stats, latest_stats, on='Player', how='left')
+            # Merge with latest stats
+            final_stats = pd.merge(final_stats, latest_stats, on='Player', how='left')
             
-            # Merge with player information
-            final_stats = pd.merge(final_stats, players_df[['Player', 'Position', 'Height', 'Weight']], 
-                                 on='Player', how='left')
+            # Add player information if available
+            if 'firstName' in players_df.columns and 'lastName' in players_df.columns:
+                players_df['Player'] = players_df['firstName'] + ' ' + players_df['lastName']
+                
+                # Determine position based on guard, forward, center columns
+                players_df['Position'] = players_df.apply(
+                    lambda row: 'G' if row['guard'] == 1 else 'F' if row['forward'] == 1 else 'C' if row['center'] == 1 else 'Unknown',
+                    axis=1
+                )
+                
+                final_stats = pd.merge(final_stats, 
+                                     players_df[['Player', 'Position', 'height', 'bodyWeight']], 
+                                     on='Player', how='left')
+                
+                # Rename columns to match expected format
+                final_stats.rename(columns={
+                    'height': 'Height',
+                    'bodyWeight': 'Weight'
+                }, inplace=True)
             
             return final_stats
             
         except Exception as e:
             logger.error(f"Error processing data: {str(e)}")
             raise
+
+    def get_all_players(self) -> List[str]:
+        """Get a list of all player names"""
+        try:
+            # Fetch fresh data if cache is empty or older than cache_duration
+            if self._cache is None or self._last_fetch is None or \
+               datetime.now() - self._last_fetch > self._cache_duration:
+                self._cache = self._fetch_data()
+                self._last_fetch = datetime.now()
+            
+            return self._player_names
+            
+        except Exception as e:
+            logger.error(f"Error getting player names: {str(e)}")
+            return []
 
     def get_player_stats(self, player_name: str) -> Optional[Dict]:
         """Get statistics for a specific player"""
@@ -176,10 +257,13 @@ class KaggleDataFetcher:
             # Convert to dictionary and format numbers
             stats = player_data.iloc[0].to_dict()
             
-            # Format numeric values
+            # Format numeric values and handle invalid floats
             for key, value in stats.items():
                 if isinstance(value, float):
-                    stats[key] = round(value, 1)
+                    if pd.isna(value) or value == float('inf') or value == float('-inf'):
+                        stats[key] = 0
+                    else:
+                        stats[key] = round(value, 1)
             
             return stats
             
